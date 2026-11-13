@@ -1,0 +1,37 @@
+name: money-service-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      RAAD_EDGE_ROLE_ARN: arn:aws:iam::111111111111:role/raad-build-edge
+      RAAD_CORRELATION_SECRET_ARN: arn:aws:secretsmanager:us-east-1:111111111111:secret:raad/dev/correlation-hmac-build
+      CDK_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --global aws-cdk
+      - run: uv sync --locked --all-groups
+      - run: uv run pytest tests/unit
+      - run: docker compose up -d dynamodb-local
+      - run: uv run pytest tests/integration
+      - run: docker compose down
+      - run: uv run pytest tests/unit/test_ledger_rules.py --cov=raad_money.ledger --cov-branch --cov-fail-under=95
+      - run: uv run ruff check src tests
+      - run: uv run mypy src
+      - run: uv run pip-audit
+      - run: uv run cdk synth
+      - uses: gitleaks/gitleaks-action@v2

@@ -1,0 +1,41 @@
+name: deploy-money-service-dev
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "openapi/**"
+      - "app.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/deploy-dev.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      RAAD_ENVIRONMENT: dev
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --global aws-cdk
+      - run: uv sync --locked --all-groups
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Read platform role and secret references
+        run: |
+          echo "RAAD_EDGE_ROLE_ARN=$(aws ssm get-parameter --name /raad/dev/platform-edge-role-arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+          echo "RAAD_CORRELATION_SECRET_ARN=$(aws ssm get-parameter --name /raad/dev/correlation-hmac/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+      - run: uv run cdk deploy --all --require-approval never
