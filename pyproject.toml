@@ -6,7 +6,19 @@ requires-python = ">=3.12,<3.13"
 dependencies = ["aws-cdk-lib>=2.180,<3", "constructs>=10,<11", "boto3>=1.35,<2", "PyJWT[crypto]>=2.10,<3", "requests>=2.32,<3"]
 
 [dependency-groups]
-dev = ["pytest>=8.3,<9", "pytest-cov>=6,<7", "hypothesis>=6.120,<7", "ruff>=0.9,<1", "mypy>=1.14,<2", "moto[dynamodb]>=5.0,<6", "cdk-nag>=2.35,<3", "openapi-spec-validator>=0.7,<1", "pip-audit>=2.7,<3"]
+dev = [
+    "pytest>=9.0.3,<10",
+    "pytest-cov>=6,<7",
+    "hypothesis>=6.120,<7",
+    "ruff>=0.9,<1",
+    "mypy>=1.14,<2",
+    "moto[dynamodb]>=5.0,<6",
+    "cdk-nag>=2.35,<3",
+    "openapi-spec-validator>=0.7,<1",
+    "pip-audit>=2.7,<3",
+    "boto3-stubs>=1.44.3",
+    "types-requests>=2.33.0.20261030",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -17,7 +29,7 @@ packages = ["src/raad_money"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=raad_money --cov-report=term-missing --cov-fail-under=80"
+addopts = "--import-mode=importlib --cov=raad_money --cov-report=term-missing --cov-fail-under=80"
 
 [tool.coverage.run]
 branch = true

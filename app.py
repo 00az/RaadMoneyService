@@ -12,7 +12,9 @@ environment = os.environ.get("RAAD_ENVIRONMENT", "dev")
 edge_role_arn = app.node.try_get_context("edgeRoleArn") or os.environ.get("RAAD_EDGE_ROLE_ARN", "")
 correlation_secret_arn = os.environ.get("RAAD_CORRELATION_SECRET_ARN", "")
 if not edge_role_arn or not correlation_secret_arn:
-    raise ValueError("RAAD_EDGE_ROLE_ARN and RAAD_CORRELATION_SECRET_ARN must come from the deployed Raad platform SSM parameters")
+    raise ValueError(
+        "RAAD_EDGE_ROLE_ARN and RAAD_CORRELATION_SECRET_ARN must come from the deployed Raad platform SSM parameters"
+    )
 MoneyServiceStack(
     app,
     f"RaadMoneyService-{environment}",

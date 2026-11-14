@@ -22,7 +22,7 @@ def test_directory_rejects_duplicate_normalized_email(directory_table: str) -> N
 def test_directory_lookup_does_not_match_partial_email(directory_table: str) -> None:
     directory = WalletDirectory(directory_table)
     directory.register("holder-1", "person@example.com", "Person")
-    with pytest.raises(LookupError):
+    with pytest.raises(ValueError):
         directory.find_by_email("person@exam")
 
 

@@ -25,13 +25,15 @@ jobs:
           node-version: 22
       - run: npm install --global aws-cdk
       - run: uv sync --locked --all-groups
-      - run: uv run pytest tests/unit
       - run: docker compose up -d dynamodb-local
-      - run: uv run pytest tests/integration
-      - run: docker compose down
-      - run: uv run pytest tests/unit/test_ledger_rules.py --cov=raad_money.ledger --cov-branch --cov-fail-under=95
-      - run: uv run ruff check src tests
+      - run: uv run pytest tests/unit tests/integration
+      - run: uv run pytest tests/unit/test_ledger_rules.py --cov-reset --cov=raad_money.ledger --cov-branch --cov-report=json:artifacts/coverage/u1-ledger.json --cov-report=term-missing
+      - run: uv run python scripts/check_ledger_coverage.py artifacts/coverage/u1-ledger.json
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
       - run: uv run mypy src
       - run: uv run pip-audit
       - run: uv run cdk synth
       - uses: gitleaks/gitleaks-action@v2
+      - if: always()
+        run: docker compose stop dynamodb-local

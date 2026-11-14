@@ -1,11 +1,20 @@
 openapi: 3.1.0
 info:
   title: RAAD Money API
-  version: 1.0.0
+  version: 1.0.0-u1.2
   description: >
     Wallet balance, recipient resolution, wallet-to-wallet transfer and transfer
     history for the RAAD MVP. Every amount is a whole number of halalas and the
-    only currency is SAR.
+    only currency is SAR. This U1 partial pre-release validates Idempotency-Key
+    but does not save or replay outcomes: never retry a transfer after an unknown
+    result. Full replay and cursor guarantees below are the U2 compatibility
+    target. U1 supports the first history page only, reports hasMore and
+    X-U1-History-Truncated, and leaves nextCursor null even when more rows exist.
+x-u1-conformance:
+  savedReplay: false
+  automaticOrManualUncertainResubmit: false
+  historyPages: first-only
+  amountRule: positive-integer-halalas
 servers:
   - url: https://{apiHost}/money/v1
     variables:
@@ -395,6 +404,9 @@ components:
       additionalProperties: true
       required: [items, nextCursor]
       properties:
+        hasMore:
+          type: boolean
+          description: U1 flag; true means this page is truncated and later pages require U2.
         items:
           type: array
           maxItems: 100

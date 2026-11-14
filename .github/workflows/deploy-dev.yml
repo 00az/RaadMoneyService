@@ -30,6 +30,14 @@ jobs:
           node-version: 22
       - run: npm install --global aws-cdk
       - run: uv sync --locked --all-groups
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run mypy src
+      - run: docker compose up -d dynamodb-local
+      - run: uv run pytest tests/unit tests/integration
+      - run: uv run pytest tests/unit/test_ledger_rules.py --cov-reset --cov=raad_money.ledger --cov-branch --cov-report=json:artifacts/coverage/u1-ledger.json --cov-report=term-missing
+      - run: uv run python scripts/check_ledger_coverage.py artifacts/coverage/u1-ledger.json
+      - run: uv run pip-audit
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN_DEV }}
@@ -38,4 +46,15 @@ jobs:
         run: |
           echo "RAAD_EDGE_ROLE_ARN=$(aws ssm get-parameter --name /raad/dev/platform-edge-role-arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
           echo "RAAD_CORRELATION_SECRET_ARN=$(aws ssm get-parameter --name /raad/dev/correlation-hmac/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
-      - run: uv run cdk deploy --all --require-approval never
+      - run: uv run cdk synth --all
+      - run: uv run cdk diff --all
+      - name: Expand schema with money requests disabled
+        run: uv run cdk deploy --all --require-approval never --parameters RaadMoneyService-dev:ActivateCanonicalWriter=false
+      - name: Refuse activation until every history reference is canonical
+        run: uv run python scripts/migrate_transactions.py --environment dev --ledger-table raad-dev-ledger --transactions-table raad-dev-transactions --check-ready
+      # On failure requests stay disabled. Explicit engineer migration is required;
+      # never reset balances or roll back to the incompatible legacy writer.
+      - name: Activate canonical-aware writer after readiness
+        run: uv run cdk deploy --all --require-approval never --parameters RaadMoneyService-dev:ActivateCanonicalWriter=true
+      - if: always()
+        run: docker compose stop dynamodb-local

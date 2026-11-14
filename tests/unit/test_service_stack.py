@@ -8,13 +8,22 @@ from raad_money.infrastructure import MoneyServiceStack
 
 def template() -> Template:
     app = cdk.App()
-    stack = MoneyServiceStack(app, "Service", environment="dev", verifier_parameter="/raad/dev/verifier", correlation_secret_arn="arn:aws:secretsmanager:us-east-1:111111111111:secret:raad/dev/correlation-hmac-abc", edge_role_arn="arn:aws:iam::111111111111:role/raad-dev-edge")
+    stack = MoneyServiceStack(
+        app,
+        "Service",
+        environment="dev",
+        verifier_parameter="/raad/dev/verifier",
+        correlation_secret_arn="arn:aws:secretsmanager:us-east-1:111111111111:secret:raad/dev/correlation-hmac-abc",
+        edge_role_arn="arn:aws:iam::111111111111:role/raad-dev-edge",
+    )
     return Template.from_stack(stack)
 
 
-def test_service_owns_two_separate_encrypted_tables() -> None:
-    template().resource_count_is("AWS::DynamoDB::Table", 2)
-    template().has_resource_properties("AWS::DynamoDB::Table", {"SSESpecification": {"SSEEnabled": True}})
+def test_service_owns_three_separate_encrypted_tables() -> None:
+    template().resource_count_is("AWS::DynamoDB::Table", 3)
+    template().has_resource_properties(
+        "AWS::DynamoDB::Table", {"SSESpecification": {"SSEEnabled": True}}
+    )
 
 
 def test_tables_use_on_demand_capacity() -> None:
@@ -22,7 +31,9 @@ def test_tables_use_on_demand_capacity() -> None:
 
 
 def test_money_api_has_seven_second_timeout_and_dev_cap() -> None:
-    template().has_resource_properties("AWS::Lambda::Function", {"Timeout": 7, "ReservedConcurrentExecutions": 20})
+    template().has_resource_properties(
+        "AWS::Lambda::Function", {"Timeout": 7, "ReservedConcurrentExecutions": 20}
+    )
 
 
 def test_function_url_requires_iam_authentication() -> None:
@@ -30,15 +41,55 @@ def test_function_url_requires_iam_authentication() -> None:
 
 
 def test_function_url_is_published_to_environment_parameter() -> None:
-    template().has_resource_properties("AWS::SSM::Parameter", {"Name": "/raad/dev/money-api/function-url"})
+    template().has_resource_properties(
+        "AWS::SSM::Parameter", {"Name": "/raad/dev/money-api/function-url"}
+    )
 
 
 def test_edge_invoke_permission_is_limited_to_function_url() -> None:
     rendered = template().to_json()
-    policies = [resource["Properties"] for resource in rendered["Resources"].values() if resource["Type"] == "AWS::Lambda::Permission"]
-    assert any(policy.get("Action") == "lambda:InvokeFunctionUrl" and policy.get("FunctionUrlAuthType") == "AWS_IAM" for policy in policies)
-    assert any(policy.get("Action") == "lambda:InvokeFunction" and policy.get("InvokedViaFunctionUrl") is True for policy in policies)
+    policies = [
+        resource["Properties"]
+        for resource in rendered["Resources"].values()
+        if resource["Type"] == "AWS::Lambda::Permission"
+    ]
+    assert any(
+        policy.get("Action") == "lambda:InvokeFunctionUrl"
+        and policy.get("FunctionUrlAuthType") == "AWS_IAM"
+        for policy in policies
+    )
+    assert any(
+        policy.get("Action") == "lambda:InvokeFunction"
+        and policy.get("InvokedViaFunctionUrl") is True
+        for policy in policies
+    )
 
 
 def test_dev_money_logs_have_fourteen_day_retention() -> None:
     template().has_resource_properties("AWS::Logs::LogGroup", {"RetentionInDays": 14})
+
+
+def test_writer_is_disabled_by_default_until_canonical_cutover_is_ready() -> None:
+    rendered = template().to_json()
+    assert rendered["Parameters"]["ActivateCanonicalWriter"]["Default"] == "false"
+    template().has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Environment": {
+                "Variables": Match.object_like(
+                    {"CANONICAL_WRITER_ACTIVE": {"Ref": "ActivateCanonicalWriter"}}
+                )
+            }
+        },
+    )
+
+
+def test_transactions_table_uses_only_transfer_id_key_and_no_ttl() -> None:
+    tables = template().find_resources("AWS::DynamoDB::Table")
+    table = next(
+        r["Properties"]
+        for r in tables.values()
+        if r["Properties"].get("TableName") == "raad-dev-transactions"
+    )
+    assert table["KeySchema"] == [{"AttributeName": "transferId", "KeyType": "HASH"}]
+    assert "TimeToLiveSpecification" not in table
