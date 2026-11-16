@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# AWS CDK output
+cdk.out/
+cdk.context.json
+
+# AI-DLC runtime files; the shared record lives in the Raad repo.
+/aidlc/
+
+# Local environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store

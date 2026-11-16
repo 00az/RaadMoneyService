@@ -1,1 +1,0 @@
-"""RAAD simulated money service."""
