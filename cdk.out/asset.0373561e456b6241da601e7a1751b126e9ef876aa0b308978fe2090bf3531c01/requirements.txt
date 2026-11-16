@@ -1,0 +1,2 @@
+boto3==1.44.2
+PyJWT[crypto]==2.15.1

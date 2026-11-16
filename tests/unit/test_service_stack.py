@@ -36,6 +36,36 @@ def test_money_api_has_seven_second_timeout_and_dev_cap() -> None:
     )
 
 
+def test_money_api_declares_x86_to_match_native_bundle() -> None:
+    template().has_resource_properties("AWS::Lambda::Function", {"Architectures": ["x86_64"]})
+
+
+def test_execution_role_has_no_managed_policy_or_unbounded_logs():
+    built = template()
+    assert all(
+        not role["Properties"].get("ManagedPolicyArns")
+        for role in built.find_resources("AWS::IAM::Role").values()
+    )
+    for policy in built.find_resources("AWS::IAM::Policy").values():
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            if "logs:PutLogEvents" in statement.get("Action", []):
+                assert statement["Resource"] != "*"
+
+
+def test_service_bundle_matches_x86_ci_platform(monkeypatch):
+    from aws_cdk import aws_lambda as lambda_
+
+    platforms = []
+
+    def asset(*args, **kwargs):
+        platforms.append(kwargs["bundling"].platform)
+        return lambda_.Code.from_inline("def handle(event, context): return {}")
+
+    monkeypatch.setattr(lambda_.Code, "from_asset", asset)
+    template()
+    assert platforms == ["linux/amd64"]
+
+
 def test_function_url_requires_iam_authentication() -> None:
     template().has_resource_properties("AWS::Lambda::Url", {"AuthType": "AWS_IAM"})
 

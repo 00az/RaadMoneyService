@@ -10,6 +10,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_ssm as ssm
+from cdk_nag import NagSuppressions
 from constructs import Construct
 
 
@@ -82,16 +83,22 @@ class MoneyServiceStack(Stack):
             log_group_name=f"/raad/{environment}/money-api",
             retention=logs.RetentionDays.TWO_WEEKS,
         )
+        execution_role = iam.Role(
+            self, "MoneyApiExecutionRole", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com")
+        )
+        self.log_group.grant_write(execution_role)
         self.api = lambda_.Function(
             self,
             "MoneyApi",
             function_name=f"raad-{environment}-money-api",
             runtime=lambda_.Runtime.PYTHON_3_12,
+            architecture=lambda_.Architecture.X86_64,
             handler="raad_money.api.handle",
             code=lambda_.Code.from_asset(
                 "src",
                 bundling=BundlingOptions(
                     image=lambda_.Runtime.PYTHON_3_12.bundling_image,
+                    platform="linux/amd64",
                     command=[
                         "bash",
                         "-c",
@@ -110,6 +117,17 @@ class MoneyServiceStack(Stack):
                 "ENVIRONMENT": environment,
             },
             log_group=self.log_group,
+            role=execution_role,
+        )
+        # Tested supported AL2023 pin; do not jump major versions independently of CI.
+        NagSuppressions.add_resource_suppressions(
+            self.api,
+            [
+                {
+                    "id": "AwsSolutions-L1",
+                    "reason": "Approved tested Python3.12 AL2023 pin is AWS-supported until 2028-10-31 with managed patches. Dependency audit and package tests gate release; major migration requires synchronized local/CI pins.",
+                }
+            ],
         )
         # Ledger mutation uses transactions on the Ledger table. The directory role has separate access.
         self.api.add_environment("REQUIRE_FORWARDING_ENVELOPE", "true")

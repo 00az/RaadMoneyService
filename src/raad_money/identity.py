@@ -4,23 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.request import HTTPRedirectHandler, build_opener
 
 import boto3
 import jwt
+from botocore import UNSIGNED
+from botocore.config import Config
 from jwt import PyJWKClient
-
-
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(
-        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
-    ) -> None:
-        return None
-
-
-urlopen = build_opener(_NoRedirect()).open
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,13 +26,15 @@ class TokenVerifier:
     """Validates issuer, audience, token use and subject against immutable env config."""
 
     def __init__(self, issuer: str, audience: str, profile_url: str) -> None:
-        if (
-            not issuer.startswith("https://")
-            or not audience
-            or not profile_url.startswith("https://")
-        ):
+        provider = re.fullmatch(
+            r"https://cognito-idp\.([a-z0-9-]+)\.amazonaws\.com/([a-z0-9-]+_[A-Za-z0-9]+)",
+            issuer.rstrip("/"),
+        )
+        if provider is None or not audience or profile_url != issuer.rsplit("/", 1)[0] + "/":
             raise ValueError("invalid verifier configuration")
         self.issuer, self.audience, self.profile_url = issuer.rstrip("/"), audience, profile_url
+        self.region = provider.group(1)
+        self.profile_client: Any = None
         self.jwks = PyJWKClient(
             f"{self.issuer}/.well-known/jwks.json",
             cache_jwk_set=True,
@@ -111,16 +105,36 @@ class TokenVerifier:
             or not claims.get("sub")
         ):
             raise PermissionError("invalid access token")
-        request = __import__("urllib.request", fromlist=["Request"]).Request(
-            self.profile_url, headers={"Authorization": f"Bearer {token}"}
-        )
-        with urlopen(request, timeout=1.0) as response:
-            profile = json.loads(response.read())
+        # SDK authentication supplies this scope. OAuth userInfo requires openid
+        # and must not be called with these tokens, even if OAuth is enabled on the client.
+        if "aws.cognito.signin.user.admin" not in str(claims.get("scope", "")).split():
+            raise PermissionError("profile scope missing")
+        if self.profile_client is None:
+            self.profile_client = boto3.client(
+                "cognito-idp",
+                region_name=self.region,
+                endpoint_url=self.profile_url,
+                config=Config(
+                    signature_version=UNSIGNED,
+                    connect_timeout=0.25,
+                    read_timeout=0.75,
+                    retries={"total_max_attempts": 1},
+                ),
+            )
+        try:
+            response = self.profile_client.get_user(AccessToken=token)
+        except self.profile_client.exceptions.NotAuthorizedException as error:
+            raise PermissionError("profile access denied") from error
+        attributes = response.get("UserAttributes", [])
+        profile = {item["Name"]: item["Value"] for item in attributes}
+        if len(profile) != len(attributes):
+            raise PermissionError("ambiguous profile")
         if profile.get("sub") != claims["sub"]:
             raise PermissionError("profile subject mismatch")
         email, display_name = profile.get("email"), profile.get("name")
         if (
             not isinstance(email, str)
+            or profile.get("email_verified") != "true"
             or not isinstance(display_name, str)
             or not display_name.strip()
         ):
