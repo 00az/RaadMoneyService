@@ -3,19 +3,33 @@
 from __future__ import annotations
 
 import os
+import re
 import time
-import unicodedata
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
-from raad_money.ledger import CompletedTransfer, LedgerRules, Wallet
+from raad_money.email_address import normalize_email
+from raad_money.ledger import CompletedTransfer, TransferOutcome, format_instant
+from raad_money.store_errors import (
+    CommitUncertain,
+    OutcomeAlreadyRecorded,
+    ReferenceCollision,
+    TransientStoreError,
+    WalletChanged,
+)
+
+if TYPE_CHECKING:
+    from raad_money.transfers import TransferCommit, WalletState
+
+_UNCERTAIN_CODES = {"InternalServerError", "ServiceUnavailable"}
+_REASONS_IN_MESSAGE = re.compile(r"\[([^\]]*)\]\s*$")
 
 
 def _resource() -> Any:
@@ -31,12 +45,24 @@ def _resource() -> Any:
     )
 
 
+def _now() -> str:
+    return format_instant(datetime.now(UTC))
+
+
 class HistoryIntegrityError(RuntimeError):
     """Canonical history cannot be safely assembled."""
 
 
+class ProfileVersionMissing(RuntimeError):
+    """A saved outcome references a profile version that cannot be read; never recompute it."""
+
+
 class EmailConflict(ValueError):
     """Verified email is already held by another identity."""
+
+
+class HolderExists(ValueError):
+    """The holder is already registered; an existing identity is never overwritten."""
 
 
 class HistoryPage(list[dict[str, Any]]):
@@ -53,25 +79,24 @@ class RecipientMissing(LookupError):
     """No holder resolves to the supplied complete email address."""
 
 
-def normalize_email(email: str) -> str:
-    if not isinstance(email, str):
-        raise TypeError("valid email is required")
-    normalized = unicodedata.normalize("NFC", email.strip()).lower()
-    local, separator, domain = normalized.partition("@")
-    if (
-        not separator
-        or not local
-        or not domain
-        or "@" in domain
-        or len(normalized) > 254
-        or "." not in domain
-    ):
-        raise ValueError("valid email is required")
-    return normalized
+def error_code(error: ClientError) -> str:
+    return str(error.response.get("Error", {}).get("Code", ""))
+
+
+def cancellation_codes(error: ClientError) -> list[str]:
+    """Per-item transaction cancellation codes, from the response or its message."""
+    reasons = error.response.get("CancellationReasons")
+    if reasons:
+        return [str(reason.get("Code") or "None") for reason in reasons]
+    match = _REASONS_IN_MESSAGE.search(str(error.response.get("Error", {}).get("Message", "")))
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split(",")]
 
 
 class LedgerRepository:
-    """Owns wallet and transfer records; all balance writes use transactions."""
+    """Owns wallets, keyed outcomes, receipts and transfer records; money moves only in
+    conditional transactions."""
 
     def __init__(
         self, table_name: str, resource: Any | None = None, *, transactions_table: str | None = None
@@ -110,7 +135,6 @@ class LedgerRepository:
             return existing, False
         wallet_id = str(uuid.uuid4())
         wallet_pk = f"WALLET#{wallet_id}"
-        now = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         owner = {
             "pk": f"OWNER#{owner_id}",
             "sk": "WALLET",
@@ -125,7 +149,8 @@ class LedgerRepository:
             "owner_id": owner_id,
             "balance_halalas": 100_000,
             "opening_balance_halalas": 100_000,
-            "opened_at": now,
+            "opened_at": _now(),
+            "transfer_sequence": 0,
         }
         try:
             self.table.meta.client.transact_write_items(
@@ -148,82 +173,179 @@ class LedgerRepository:
             )
             return wallet, True
         except ClientError as error:
-            if error.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            if error_code(error) == "TransactionCanceledException":
                 existing = self.get_wallet(owner_id)
                 if existing:
                     return existing, False
             raise
 
-    def transfer(
-        self, sender: dict[str, Any], recipient: dict[str, Any], amount: int
-    ) -> dict[str, Any]:
-        decision = LedgerRules.transfer(
-            Wallet(sender["wallet_id"], sender["balance_halalas"]),
-            Wallet(recipient["wallet_id"], recipient["balance_halalas"]),
-            amount,
-        )
-        transfer_id, reference = str(uuid.uuid4()), f"TXN-{uuid.uuid4().hex[:20].upper()}"
-        completed_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        canonical = CompletedTransfer(
-            transfer_id,
-            reference,
-            sender["wallet_id"],
-            recipient["wallet_id"],
-            amount,
-            completed_at,
-        )
-        transfer = _transfer_from_item(canonical.as_item())
-        items: list[dict[str, Any]] = []
-        for wallet, new_balance in (
-            (sender, decision.sender.balance_halalas),
-            (recipient, decision.recipient.balance_halalas),
-        ):
+    def get_outcome(self, owner_id: str, idempotency_key: str) -> TransferOutcome | None:
+        """Strong read of the first outcome for (verified sender, Idempotency-Key)."""
+        item = self.table.get_item(
+            Key=self._outcome_key(owner_id, idempotency_key), ConsistentRead=True
+        ).get("Item")
+        return TransferOutcome.from_item(item) if item else None
+
+    def record_refusal(
+        self,
+        owner_id: str,
+        idempotency_key: str,
+        outcome: TransferOutcome,
+        *,
+        balance_guard: WalletState | None,
+    ) -> None:
+        """Save a final business refusal once; a low-balance refusal is guarded by the wallet
+        state it was decided on, so a concurrent change forces re-evaluation."""
+        items: list[dict[str, Any]] = [self._outcome_put(owner_id, idempotency_key, outcome)]
+        if balance_guard is not None:
             items.append(
                 {
-                    "Update": {
+                    "ConditionCheck": {
                         "TableName": self.table.name,
-                        "Key": self._encode(
-                            {"pk": f"WALLET#{wallet['wallet_id']}", "sk": "WALLET"}
-                        ),
-                        "UpdateExpression": "SET balance_halalas = :balance",
-                        "ConditionExpression": "balance_halalas = :old AND balance_halalas >= :amount",
-                        "ExpressionAttributeValues": self._encode(
-                            {
-                                ":balance": new_balance,
-                                ":old": wallet["balance_halalas"],
-                                ":amount": amount if wallet is sender else 0,
-                            }
-                        ),
+                        "Key": {"pk": f"WALLET#{balance_guard.wallet_id}", "sk": "WALLET"},
+                        "ConditionExpression": "balance_halalas = :balance AND "
+                        "transfer_sequence = :sequence",
+                        "ExpressionAttributeValues": {
+                            ":balance": balance_guard.balance_halalas,
+                            ":sequence": balance_guard.transfer_sequence,
+                        },
                     }
                 }
             )
-        items.append(
+        self._transact(items, outcome_index=0, wallet_indexes={1}, reference_index=None)
+
+    def commit_transfer(self, commit: TransferCommit) -> None:
+        """One all-or-nothing change: both wallets, the canonical row, U1 reference rows,
+        the first outcome and the unique reference marker."""
+        outcome = commit.outcome
+        if (
+            outcome.transfer_id is None
+            or outcome.reference is None
+            or outcome.completed_at is None
+            or outcome.amount_halalas is None
+        ):
+            raise ValueError("only a completed outcome can be committed")
+        sender_ordinal = commit.sender.transfer_sequence + 1
+        recipient_ordinal = commit.recipient.transfer_sequence + 1
+        canonical = CompletedTransfer(
+            outcome.transfer_id,
+            outcome.reference,
+            commit.sender.wallet_id,
+            commit.recipient.wallet_id,
+            outcome.amount_halalas,
+            outcome.completed_at,
+        ).as_item()
+        canonical.update(
+            completedSortKey=commit.sort_key,
+            senderOrdinal=sender_ordinal,
+            recipientOrdinal=recipient_ordinal,
+        )
+        items = [
+            self._wallet_update(commit.sender, commit.sender_balance_after, commit.sort_key),
+            self._wallet_update(commit.recipient, commit.recipient_balance_after, commit.sort_key),
             {
                 "Put": {
                     "TableName": self.transactions.name,
-                    "Item": canonical.as_item(),
+                    "Item": canonical,
                     "ConditionExpression": "attribute_not_exists(transferId)",
                 }
-            }
-        )
-        for wallet in (sender, recipient):
+            },
+        ]
+        for state in (commit.sender, commit.recipient):
             items.append(
                 {
                     "Put": {
                         "TableName": self.table.name,
                         "Item": {
-                            "pk": f"WALLET#{wallet['wallet_id']}",
-                            "sk": f"TRANSFER#{completed_at}#{transfer_id}",
-                            "transferId": transfer_id,
+                            "pk": f"WALLET#{state.wallet_id}",
+                            "sk": f"TRANSFER#{outcome.completed_at}#{outcome.transfer_id}",
+                            "transferId": outcome.transfer_id,
                         },
                         "ConditionExpression": "attribute_not_exists(pk)",
                     }
                 }
             )
-        self.table.meta.client.transact_write_items(TransactItems=items)
-        return {**transfer, "sender_balance_halalas": decision.sender.balance_halalas}
+        items.append(self._outcome_put(commit.owner_id, commit.idempotency_key, outcome))
+        items.append(
+            {
+                "Put": {
+                    "TableName": self.table.name,
+                    "Item": {
+                        "pk": f"REFERENCE#{outcome.reference}",
+                        "sk": "REFERENCE",
+                        "transferId": outcome.transfer_id,
+                    },
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            }
+        )
+        self._transact(items, outcome_index=5, wallet_indexes={0, 1}, reference_index=6)
+
+    def get_event_receipt(self, event_id: str) -> dict[str, Any] | None:
+        item = self.table.get_item(
+            Key={"pk": f"EVENT#{event_id}", "sk": "RECEIPT"}, ConsistentRead=True
+        ).get("Item")
+        return dict(item) if item else None
+
+    def get_user_receipt(self, user_id: str) -> dict[str, Any] | None:
+        item = self.table.get_item(
+            Key={"pk": f"USER_RECEIPT#{user_id}", "sk": "RECEIPT"}, ConsistentRead=True
+        ).get("Item")
+        return dict(item) if item else None
+
+    def record_receipt(self, event_id: str, user_id: str, environment: str) -> str:
+        """Claim the first consistent (eventId, userId) pair; both mappings are unique.
+
+        Returns `recorded`, `duplicate` (this pair or this user was already processed) or
+        `conflict` (the event ID is already bound to a different user).
+        """
+        received_at = _now()
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": {
+                                "pk": f"EVENT#{event_id}",
+                                "sk": "RECEIPT",
+                                "entity": "event_receipt",
+                                "user_id": user_id,
+                                "environment": environment,
+                                "received_at": received_at,
+                            },
+                            "ConditionExpression": "attribute_not_exists(pk)",
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table.name,
+                            "Item": {
+                                "pk": f"USER_RECEIPT#{user_id}",
+                                "sk": "RECEIPT",
+                                "entity": "user_receipt",
+                                "event_id": event_id,
+                                "environment": environment,
+                                "received_at": received_at,
+                            },
+                            "ConditionExpression": "attribute_not_exists(pk)",
+                        }
+                    },
+                ]
+            )
+        except ClientError as error:
+            if error_code(error) != "TransactionCanceledException":
+                raise
+            existing = self.get_event_receipt(event_id)
+            if existing and existing.get("user_id") != user_id:
+                return "conflict"
+            if existing or self.get_user_receipt(user_id):
+                return "duplicate"
+            raise TransientStoreError("receipt was not recorded") from error
+        return "recorded"
 
     def history(self, wallet_id: str, limit: int = 20) -> HistoryPage:
+        """U1 strongly consistent reference read, retained for migration verification."""
         size = min(max(limit, 1), 100)
         result = self.table.query(
             KeyConditionExpression=Key("pk").eq(f"WALLET#{wallet_id}")
@@ -259,6 +381,78 @@ class LedgerRepository:
         except (KeyError, ValueError, TypeError) as error:
             raise HistoryIntegrityError("invalid canonical history") from error
 
+    def _wallet_update(self, state: WalletState, balance: int, sort_key: str) -> dict[str, Any]:
+        return {
+            "Update": {
+                "TableName": self.table.name,
+                "Key": {"pk": f"WALLET#{state.wallet_id}", "sk": "WALLET"},
+                "UpdateExpression": "SET balance_halalas = :balance, "
+                "transfer_sequence = :next, last_completed_sort_key = :key",
+                "ConditionExpression": "balance_halalas = :old AND transfer_sequence = :sequence",
+                "ExpressionAttributeValues": {
+                    ":balance": balance,
+                    ":old": state.balance_halalas,
+                    ":sequence": state.transfer_sequence,
+                    ":next": state.transfer_sequence + 1,
+                    ":key": sort_key,
+                },
+            }
+        }
+
+    def _outcome_put(
+        self, owner_id: str, idempotency_key: str, outcome: TransferOutcome
+    ) -> dict[str, Any]:
+        return {
+            "Put": {
+                "TableName": self.table.name,
+                "Item": {
+                    **self._outcome_key(owner_id, idempotency_key),
+                    "entity": "transfer_request",
+                    "createdAt": _now(),
+                    **outcome.as_item(),
+                },
+                "ConditionExpression": "attribute_not_exists(pk)",
+            }
+        }
+
+    @staticmethod
+    def _outcome_key(owner_id: str, idempotency_key: str) -> dict[str, str]:
+        if not owner_id or not idempotency_key:
+            raise ValueError("sender and idempotency key are required")
+        return {"pk": f"REQUEST#{owner_id}", "sk": f"KEY#{idempotency_key}"}
+
+    def _transact(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        outcome_index: int,
+        wallet_indexes: set[int],
+        reference_index: int | None,
+    ) -> None:
+        """Run one transaction and translate its cancellation into a service decision."""
+        try:
+            self.table.meta.client.transact_write_items(TransactItems=items)
+        except ClientError as error:
+            code = error_code(error)
+            if code in _UNCERTAIN_CODES:
+                raise CommitUncertain from error
+            if code != "TransactionCanceledException":
+                raise TransientStoreError("ledger write was not applied") from error
+            reasons = cancellation_codes(error)
+            if _reason(reasons, outcome_index) == "ConditionalCheckFailed":
+                raise OutcomeAlreadyRecorded from error
+            if reference_index is not None and _reason(reasons, reference_index) == (
+                "ConditionalCheckFailed"
+            ):
+                raise ReferenceCollision from error
+            if "TransactionConflict" in reasons or any(
+                _reason(reasons, index) == "ConditionalCheckFailed" for index in wallet_indexes
+            ):
+                raise WalletChanged from error
+            raise TransientStoreError("ledger transaction was cancelled") from error
+        except BotoCoreError as error:
+            raise CommitUncertain from error
+
     @staticmethod
     def _encode(value: dict[str, Any]) -> dict[str, Any]:
         # Resource clients already marshal native values, including transactions.
@@ -287,8 +481,12 @@ class LedgerRepository:
         return [_normalize_money_item(item) for item in items]
 
 
+def _reason(reasons: list[str], index: int) -> str:
+    return reasons[index] if index < len(reasons) else "None"
+
+
 class WalletDirectory:
-    """Owns holder personal data and exact normalized-email resolution."""
+    """Owns holder personal data, immutable profile versions and exact email resolution."""
 
     def __init__(self, table_name: str, resource: Any | None = None) -> None:
         self.table = (resource or _resource()).Table(table_name)
@@ -297,52 +495,84 @@ class WalletDirectory:
         normalized = normalize_email(email)
         if not holder_id or not display_name.strip():
             raise ValueError("holder id and display name are required")
+        version_id = str(uuid.uuid4())
+        registered_at = _now()
+        display_email = email.strip()
+        try:
+            self._register_items(
+                holder_id, normalized, display_email, display_name, registered_at, version_id
+            )
+        except ClientError as error:
+            if error_code(error) != "TransactionCanceledException":
+                raise
+            reasons = cancellation_codes(error)
+            if _reason(reasons, 0) == "ConditionalCheckFailed":
+                raise HolderExists("holder is already registered") from None
+            if _reason(reasons, 1) == "ConditionalCheckFailed":
+                raise EmailConflict("verified email ownership conflict") from None
+            raise TransientStoreError("holder registration was not applied") from None
+
+    def _register_items(
+        self,
+        holder_id: str,
+        normalized: str,
+        display_email: str,
+        display_name: str,
+        registered_at: str,
+        version_id: str,
+    ) -> None:
         self.table.meta.client.transact_write_items(
             TransactItems=[
                 {
                     "Put": {
                         "TableName": self.table.name,
-                        "Item": LedgerRepository._encode(
-                            {
-                                "pk": f"HOLDER#{holder_id}",
-                                "sk": "PROFILE",
-                                "holder_id": holder_id,
-                                "email_normalized": normalized,
-                                "display_name": display_name.strip(),
-                            }
-                        ),
+                        "Item": {
+                            "pk": f"HOLDER#{holder_id}",
+                            "sk": "PROFILE",
+                            "holder_id": holder_id,
+                            "email": display_email,
+                            "email_normalized": normalized,
+                            "display_name": display_name.strip(),
+                            "registered_at": registered_at,
+                            "profile_version_id": version_id,
+                        },
                         "ConditionExpression": "attribute_not_exists(pk)",
                     }
                 },
                 {
                     "Put": {
                         "TableName": self.table.name,
-                        "Item": LedgerRepository._encode(
-                            {"pk": f"EMAIL#{normalized}", "sk": "HOLDER", "holder_id": holder_id}
-                        ),
+                        "Item": {
+                            "pk": f"EMAIL#{normalized}",
+                            "sk": "HOLDER",
+                            "holder_id": holder_id,
+                        },
                         "ConditionExpression": "attribute_not_exists(pk)",
                     }
                 },
+                self._version_put(version_id, holder_id, display_email, display_name.strip()),
             ]
         )
 
     def ensure_holder(self, holder_id: str, email: str, display_name: str) -> None:
-        """Create a profile only when absent; never overwrite an existing identity."""
+        """Create a profile only when absent; never overwrite or merge an existing identity."""
         key = {"pk": f"HOLDER#{holder_id}", "sk": "PROFILE"}
         existing = self.table.get_item(Key=key, ConsistentRead=True).get("Item")
         if existing:
             return
         try:
             self.register(holder_id, email, display_name)
-        except self.table.meta.client.exceptions.TransactionCanceledException:
+        except (HolderExists, EmailConflict, TransientStoreError) as refusal:
             winner = self.table.get_item(Key=key, ConsistentRead=True).get("Item")
             if winner and winner.get("holder_id") == holder_id:
-                return
+                return  # A concurrent setup for this same holder won; converge on it.
+            if isinstance(refusal, EmailConflict):
+                raise
             owner = self.table.get_item(
                 Key={"pk": f"EMAIL#{normalize_email(email)}", "sk": "HOLDER"}, ConsistentRead=True
             ).get("Item")
             if owner and owner.get("holder_id") != holder_id:
-                raise EmailConflict("verified email ownership conflict")
+                raise EmailConflict("verified email ownership conflict") from None
             raise
 
     def find_by_email(self, email: str) -> dict[str, Any]:
@@ -352,11 +582,12 @@ class WalletDirectory:
         holder = result.get("Item")
         if not holder:
             raise RecipientMissing
-        return dict(
-            self.table.get_item(
-                Key={"pk": f"HOLDER#{holder['holder_id']}", "sk": "PROFILE"}, ConsistentRead=True
-            )["Item"]
-        )
+        profile = self.table.get_item(
+            Key={"pk": f"HOLDER#{holder['holder_id']}", "sk": "PROFILE"}, ConsistentRead=True
+        ).get("Item")
+        if not profile or profile.get("holder_id") != holder["holder_id"]:
+            raise RecipientMissing
+        return dict(profile)
 
     def get_by_holder_id(self, holder_id: str) -> dict[str, Any] | None:
         item = self.table.get_item(
@@ -372,11 +603,87 @@ class WalletDirectory:
         items = LedgerRepository._batch_get(self.table, keys)
         return {item["holder_id"]: item for item in items}
 
+    def ensure_profile_version(self, holder_id: str) -> dict[str, Any]:
+        """Return the holder's immutable profile version, creating one for a U1 holder."""
+        profile = self.get_by_holder_id(holder_id)
+        if profile is None:
+            raise RecipientMissing
+        version_id = profile.get("profile_version_id")
+        if version_id:
+            version = self.get_profile_version(str(version_id))
+            if version is None or version["holder_id"] != holder_id:
+                raise ProfileVersionMissing("current profile version is unreadable")
+            return version
+        created = str(uuid.uuid4())
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    self._version_put(
+                        created, holder_id, display_email(profile), str(profile["display_name"])
+                    ),
+                    {
+                        "Update": {
+                            "TableName": self.table.name,
+                            "Key": {"pk": f"HOLDER#{holder_id}", "sk": "PROFILE"},
+                            "UpdateExpression": "SET profile_version_id = :version",
+                            "ConditionExpression": "attribute_exists(pk) AND "
+                            "attribute_not_exists(profile_version_id)",
+                            "ExpressionAttributeValues": {":version": created},
+                        }
+                    },
+                ]
+            )
+        except self.table.meta.client.exceptions.TransactionCanceledException:
+            # A concurrent caller attached a version first; use that one, never a second.
+            winner = self.get_by_holder_id(holder_id) or {}
+            if not winner.get("profile_version_id"):
+                raise TransientStoreError("profile version could not be attached") from None
+            created = str(winner["profile_version_id"])
+        version = self.get_profile_version(created)
+        if version is None:
+            raise ProfileVersionMissing("new profile version is unreadable")
+        return version
+
+    def get_profile_version(self, version_id: str) -> dict[str, Any] | None:
+        item = self.table.get_item(
+            Key={"pk": f"PROFILE_VERSION#{version_id}", "sk": "VERSION"}, ConsistentRead=True
+        ).get("Item")
+        return dict(item) if item else None
+
+    def _version_put(
+        self, version_id: str, holder_id: str, email: str, display_name: str
+    ) -> dict[str, Any]:
+        return {
+            "Put": {
+                "TableName": self.table.name,
+                "Item": {
+                    "pk": f"PROFILE_VERSION#{version_id}",
+                    "sk": "VERSION",
+                    "profile_version_id": version_id,
+                    "holder_id": holder_id,
+                    "email": email,
+                    "display_name": display_name,
+                    "created_at": _now(),
+                },
+                "ConditionExpression": "attribute_not_exists(pk)",
+            }
+        }
+
+
+def display_email(profile: dict[str, Any]) -> str:
+    """The confirmed spelling kept for display; U1 holders only kept the normalized form."""
+    return str(profile.get("email") or profile["email_normalized"])
+
 
 def _normalize_money_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Convert DynamoDB Decimal values to whole-halalas ints; reject fractional data."""
+    """Convert DynamoDB Decimal values to whole-number ints; reject fractional data."""
     normalized = dict(item)
-    for field in ("balance_halalas", "opening_balance_halalas", "amount_halalas"):
+    for field in (
+        "balance_halalas",
+        "opening_balance_halalas",
+        "amount_halalas",
+        "transfer_sequence",
+    ):
         value = normalized.get(field)
         if value is None:
             continue

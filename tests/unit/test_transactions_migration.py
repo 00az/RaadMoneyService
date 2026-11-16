@@ -148,6 +148,54 @@ def test_pipeline_readiness_fails_closed_on_legacy_payloads(monkeypatch):
     ledger.meta.client.transact_write_items.assert_not_called()
 
 
+def _canonical_refs_and_wallets(**row_extra):
+    record = {**CompletedTransfer(ID, "TXN-ONE", "s", "r", 10, STAMP).as_item(), **row_extra}
+    table = transactions()
+    table.get_item.return_value = {"Item": record}
+    refs = [{"pk": row["pk"], "sk": row["sk"], "transferId": ID} for row in pair()]
+    wallets = [
+        {
+            "pk": f"WALLET#{w}",
+            "sk": "WALLET",
+            "entity": "wallet",
+            "wallet_id": w,
+            "balance_halalas": 1,
+        }
+        for w in ("s", "r")
+    ]
+    return refs + wallets, table
+
+
+def test_ordinal_plan_assigns_one_to_each_wallet_for_a_single_transfer():
+    rows, table = _canonical_refs_and_wallets()
+    row_fields, wallet_fields = migration.ordinal_plan(rows, table)
+    assert row_fields[ID] == {
+        "completedSortKey": f"{STAMP}#{ID}",
+        "senderOrdinal": 1,
+        "recipientOrdinal": 1,
+    }
+    assert wallet_fields["s"] == {
+        "transfer_sequence": 1,
+        "last_completed_sort_key": f"{STAMP}#{ID}",
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["disagreeing-ordinal", "unknown-wallet", "legacy-payload"],
+)
+def test_ordinal_plan_refuses_conflicts_instead_of_overwriting(change):
+    if change == "disagreeing-ordinal":
+        rows, table = _canonical_refs_and_wallets(senderOrdinal=7)
+    elif change == "unknown-wallet":
+        rows, table = _canonical_refs_and_wallets()
+        rows = [row for row in rows if row.get("wallet_id") != "r"]
+    else:
+        rows, table = pair(), transactions()
+    with pytest.raises(migration.MigrationConflict):
+        migration.ordinal_plan(rows, table)
+
+
 def test_fixture_setup_creates_six_distinct_new_users_without_logging_credentials(
     monkeypatch, capsys
 ):

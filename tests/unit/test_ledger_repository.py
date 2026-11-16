@@ -33,33 +33,165 @@ def test_existing_wallet_is_returned_without_crediting_again() -> None:
     table.meta.client.transact_write_items.assert_not_called()
 
 
-def test_transfer_uses_single_five_item_transaction() -> None:
-    repo, table = repository()
-    result = repo.transfer(
-        {"wallet_id": "s", "balance_halalas": 300}, {"wallet_id": "r", "balance_halalas": 20}, 100
+def commit(amount: int = 100) -> object:
+    from raad_money.ledger import TransferOutcome
+    from raad_money.transfers import TransferCommit, WalletState
+
+    return TransferCommit(
+        owner_id="holder-s",
+        idempotency_key="key-0000000000001",
+        sender=WalletState("s", "holder-s", 300, 2, "2026-11-14T00:00:00.000Z#a"),
+        recipient=WalletState("r", "holder-r", 20, 7, ""),
+        sender_balance_after=300 - amount,
+        recipient_balance_after=20 + amount,
+        sort_key="2026-11-16T00:00:00.000Z#2bc440be-a85a-4cf8-9bf1-128fc7214c60",
+        outcome=TransferOutcome.completed(
+            fingerprint="a" * 64,
+            transfer_id="2bc440be-a85a-4cf8-9bf1-128fc7214c60",
+            reference="R-23456789ABCD",
+            amount_halalas=amount,
+            balance_after_halalas=300 - amount,
+            completed_at="2026-11-16T00:00:00.000Z",
+            recipient_profile_version_id="version-r",
+        ),
     )
-    assert result["sender_balance_halalas"] == 200
-    writes = table.meta.client.transact_write_items.call_args.kwargs["TransactItems"]
-    assert len(writes) == 5
-    assert set(writes[2]["Put"]["Item"]) == {
-        "transferId",
-        "reference",
-        "senderWalletId",
-        "recipientWalletId",
-        "amountHalalas",
-        "currency",
-        "completedAt",
-    }
-    assert all(set(item["Put"]["Item"]) == {"pk", "sk", "transferId"} for item in writes[3:])
 
 
-def test_insufficient_funds_fails_before_persistence() -> None:
+def test_commit_is_one_seven_item_transaction_with_ordinals_and_no_personal_data() -> None:
     repo, table = repository()
-    with pytest.raises(ValueError, match="insufficient funds"):
-        repo.transfer(
-            {"wallet_id": "s", "balance_halalas": 1}, {"wallet_id": "r", "balance_halalas": 2}, 3
-        )
+    repo.commit_transfer(commit())  # type: ignore[arg-type]
+    writes = table.meta.client.transact_write_items.call_args.kwargs["TransactItems"]
+    assert len(writes) == 7
+    sender, recipient = writes[0]["Update"], writes[1]["Update"]
+    assert sender["ExpressionAttributeValues"][":sequence"] == 2
+    assert recipient["ExpressionAttributeValues"][":next"] == 8
+    canonical = writes[2]["Put"]["Item"]
+    assert (canonical["senderOrdinal"], canonical["recipientOrdinal"]) == (3, 8)
+    assert canonical["completedSortKey"].startswith("2026-11-16T00:00:00.000Z#")
+    assert all(set(item["Put"]["Item"]) == {"pk", "sk", "transferId"} for item in writes[3:5])
+    outcome = writes[5]["Put"]["Item"]
+    assert outcome["pk"] == "REQUEST#holder-s" and outcome["outcome"] == "completed"
+    assert writes[6]["Put"]["Item"]["pk"] == "REFERENCE#R-23456789ABCD"
+    assert "@" not in repr(writes)
+
+
+def test_refused_outcome_cannot_be_committed_as_a_transfer() -> None:
+    from dataclasses import replace
+
+    from raad_money.ledger import TransferOutcome
+
+    repo, table = repository()
+    refused = replace(commit(), outcome=TransferOutcome.refused("a" * 64, "SELF_TRANSFER"))  # type: ignore[type-var]
+    with pytest.raises(ValueError):
+        repo.commit_transfer(refused)
     table.meta.client.transact_write_items.assert_not_called()
+
+
+def cancelled(reasons: list[str], *, in_message: bool = False) -> ClientError:
+    response: dict = {"Error": {"Code": "TransactionCanceledException"}}
+    if in_message:
+        response["Error"]["Message"] = (
+            "Transaction cancelled, please refer cancellation reasons for specific reasons "
+            f"[{', '.join(reasons)}]"
+        )
+    else:
+        response["CancellationReasons"] = [{"Code": code} for code in reasons]
+    return ClientError(response, "TransactWriteItems")
+
+
+@pytest.mark.parametrize("in_message", [False, True])
+@pytest.mark.parametrize(
+    "reasons,expected",
+    [
+        (["None"] * 5 + ["ConditionalCheckFailed", "None"], "OutcomeAlreadyRecorded"),
+        (
+            ["ConditionalCheckFailed"] + ["None"] * 4 + ["ConditionalCheckFailed", "None"],
+            "OutcomeAlreadyRecorded",
+        ),
+        (["None"] * 6 + ["ConditionalCheckFailed"], "ReferenceCollision"),
+        (["None", "ConditionalCheckFailed"] + ["None"] * 5, "WalletChanged"),
+        (["TransactionConflict"] + ["None"] * 6, "WalletChanged"),
+        (["None", "None", "ConditionalCheckFailed"] + ["None"] * 4, "TransientStoreError"),
+    ],
+)
+def test_cancellation_reasons_map_to_service_decisions(
+    reasons: list[str], expected: str, in_message: bool
+) -> None:
+    from raad_money import store_errors
+
+    repo, table = repository()
+    table.meta.client.transact_write_items.side_effect = cancelled(reasons, in_message=in_message)
+    with pytest.raises(getattr(store_errors, expected)):
+        repo.commit_transfer(commit())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        (
+            ClientError({"Error": {"Code": "InternalServerError"}}, "TransactWriteItems"),
+            "CommitUncertain",
+        ),
+        (
+            ClientError({"Error": {"Code": "ThrottlingException"}}, "TransactWriteItems"),
+            "TransientStoreError",
+        ),
+        (
+            ClientError({"Error": {"Code": "TransactionCanceledException"}}, "TransactWriteItems"),
+            "TransientStoreError",
+        ),
+    ],
+)
+def test_service_errors_are_uncertain_or_transient(failure: Exception, expected: str) -> None:
+    from raad_money import store_errors
+
+    repo, table = repository()
+    table.meta.client.transact_write_items.side_effect = failure
+    with pytest.raises(getattr(store_errors, expected)):
+        repo.commit_transfer(commit())  # type: ignore[arg-type]
+
+
+def test_lost_connection_during_commit_is_uncertain_not_failed() -> None:
+    from botocore.exceptions import ReadTimeoutError
+
+    from raad_money.store_errors import CommitUncertain
+
+    repo, table = repository()
+    table.meta.client.transact_write_items.side_effect = ReadTimeoutError(endpoint_url="local")
+    with pytest.raises(CommitUncertain):
+        repo.commit_transfer(commit())  # type: ignore[arg-type]
+
+
+def test_refusal_is_guarded_only_when_balance_decided_it() -> None:
+    from raad_money.ledger import TransferOutcome
+    from raad_money.transfers import WalletState
+
+    repo, table = repository()
+    refusal = TransferOutcome.refused("b" * 64, "INSUFFICIENT_FUNDS")
+    repo.record_refusal("holder-s", "key-0000000000001", refusal, balance_guard=None)
+    assert len(table.meta.client.transact_write_items.call_args.kwargs["TransactItems"]) == 1
+    guard = WalletState("s", "holder-s", 50, 3, "")
+    repo.record_refusal("holder-s", "key-0000000000002", refusal, balance_guard=guard)
+    items = table.meta.client.transact_write_items.call_args.kwargs["TransactItems"]
+    check = items[1]["ConditionCheck"]["ExpressionAttributeValues"]
+    assert check == {":balance": 50, ":sequence": 3}
+
+
+def test_outcome_reads_are_strong_and_keyed_by_sender_and_key() -> None:
+    from raad_money.ledger import TransferOutcome
+
+    repo, table = repository()
+    table.get_item.return_value = {
+        "Item": TransferOutcome.refused("c" * 64, "SELF_TRANSFER").as_item()
+    }
+    assert repo.get_outcome("holder-s", "key-0000000000001").code == "SELF_TRANSFER"
+    kwargs = table.get_item.call_args.kwargs
+    assert kwargs["ConsistentRead"] is True
+    assert kwargs["Key"] == {"pk": "REQUEST#holder-s", "sk": "KEY#key-0000000000001"}
+    table.get_item.return_value = {}
+    assert repo.get_outcome("holder-s", "key-0000000000003") is None
+    with pytest.raises(ValueError):
+        repo.get_outcome("", "key")
 
 
 def test_history_is_strongly_consistent_and_newest_first() -> None:

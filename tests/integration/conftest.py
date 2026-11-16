@@ -30,11 +30,31 @@ def dynamodb_resource(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def transactions_table(dynamodb_resource, monkeypatch):
+    """Canonical transfer table with the same two role indexes the service stack declares."""
     name = f"transactions-{uuid4().hex}"
     dynamodb_resource.create_table(
         TableName=name,
         KeySchema=[{"AttributeName": "transferId", "KeyType": "HASH"}],
-        AttributeDefinitions=[{"AttributeName": "transferId", "AttributeType": "S"}],
+        AttributeDefinitions=[
+            {"AttributeName": "transferId", "AttributeType": "S"},
+            {"AttributeName": "senderWalletId", "AttributeType": "S"},
+            {"AttributeName": "recipientWalletId", "AttributeType": "S"},
+            {"AttributeName": "completedSortKey", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": index,
+                "KeySchema": [
+                    {"AttributeName": partition, "KeyType": "HASH"},
+                    {"AttributeName": "completedSortKey", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "KEYS_ONLY"},
+            }
+            for index, partition in (
+                ("bySenderWallet", "senderWalletId"),
+                ("byRecipientWallet", "recipientWalletId"),
+            )
+        ],
         BillingMode="PAY_PER_REQUEST",
     ).wait_until_exists()
     monkeypatch.setenv("TRANSACTIONS_TABLE", name)

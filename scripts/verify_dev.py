@@ -55,25 +55,54 @@ def main() -> None:
             f"recipient readiness failed with safe C1 status {recipient.status_code}"
         )
     transfer_headers = {**headers[0], "Idempotency-Key": uuid.uuid4().hex}
+    transfer_body = {"recipientEmail": users[1]["email"], "amountHalalas": 10_000}
     result = requests.post(
         f"{api_url}/money/v1/transfers",
         headers=transfer_headers,
-        json={"recipientEmail": users[1]["email"], "amountHalalas": 10_000},
+        json=transfer_body,
         timeout=(2.0, 8.0),
     )
     if result.status_code != 201:
         raise RuntimeError(f"transfer smoke failed with safe C1 status {result.status_code}")
+    transfer_id = result.json()["transferId"]
+    # Replay with the same key and body: the saved first result, never a second movement.
+    replay = requests.post(
+        f"{api_url}/money/v1/transfers",
+        headers=transfer_headers,
+        json=transfer_body,
+        timeout=(2.0, 8.0),
+    )
+    if (
+        replay.status_code != 201
+        or replay.headers.get("Idempotency-Replayed") != "true"
+        or replay.json()["transferId"] != transfer_id
+    ):
+        raise RuntimeError(f"replay smoke failed with safe C1 status {replay.status_code}")
+    refused = requests.post(
+        f"{api_url}/money/v1/transfers",
+        headers={**headers[0], "Idempotency-Key": uuid.uuid4().hex},
+        json={"recipientEmail": users[1]["email"], "amountHalalas": 99},
+        timeout=(2.0, 8.0),
+    )
+    if refused.status_code != 422 or refused.json().get("code") != "AMOUNT_OUT_OF_RANGE":
+        raise RuntimeError(f"range refusal smoke failed with safe C1 status {refused.status_code}")
     after_a = _get_balance(api_url, headers[0])
     after_b = _get_balance(api_url, headers[1])
     sent = _get_history(api_url, headers[0])
     received = _get_history(api_url, headers[1])
-    transfer_id = result.json()["transferId"]
-    assert before_a - after_a == 10_000 and after_b - before_b == 10_000
-    assert any(item["transferId"] == transfer_id and item["direction"] == "sent" for item in sent)
-    assert any(
+    if not (before_a - after_a == 10_000 and after_b - before_b == 10_000):
+        raise RuntimeError("balances did not move exactly once by the smoke amount")
+    if not any(item["transferId"] == transfer_id and item["direction"] == "sent" for item in sent):
+        raise RuntimeError("sender history is missing the smoke transfer")
+    if not any(
         item["transferId"] == transfer_id and item["direction"] == "received" for item in received
+    ):
+        raise RuntimeError("recipient history is missing the smoke transfer")
+    print(
+        json.dumps(
+            {"result": "passed", "transferId": transfer_id, "amountHalalas": 10_000, "replay": True}
+        )
     )
-    print(json.dumps({"result": "passed", "transferId": transfer_id, "amountHalalas": 10_000}))
 
 
 def _get_balance(api_url: str, headers: dict[str, str]) -> int:
@@ -87,7 +116,10 @@ def _get_history(api_url: str, headers: dict[str, str]) -> list[dict]:
     response = requests.get(f"{api_url}/money/v1/transfers", headers=headers, timeout=(2.0, 8.0))
     if response.status_code != 200:
         raise RuntimeError(f"history readiness failed with safe C1 status {response.status_code}")
-    return response.json()["items"]
+    page = response.json()
+    if "nextCursor" not in page:
+        raise RuntimeError("history page is missing the U2 nextCursor field")
+    return page["items"]
 
 
 if __name__ == "__main__":

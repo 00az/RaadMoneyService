@@ -1,0 +1,96 @@
+# C2 — UserConfirmed event v1 (contract ID: c2-identity-events).
+# Canonical file named in the contract design's "Contract Files, Releases and Pinning" table.
+# Owner: U4 / Raad (the event and payload). Consumer: U2 / RaadMoneyService, which pins this file.
+# Pre-release until U4's provider tests pass for the whole file; then tag contract/c2-identity-events/v1.0.0.
+asyncapi: 3.0.0
+info:
+  title: RAAD Identity Events
+  version: 1.0.0-rc.1
+  description: >
+    Account lifecycle facts emitted by the shared sign-in platform.
+
+    Transport: each environment has its own Amazon EventBridge bus, published by the platform at
+    the SSM parameter `/raad/<env>/event-bus/arn`. Every event on this channel is one EventBridge
+    event whose `source` and `detail-type` are fixed by `x-eventbridge` on the channel, and whose
+    `detail` object is the message payload below. A producer that sends any other `source` or
+    `detail-type` is not sending this event, and the consumer's rule does not match it.
+defaultContentType: application/json
+channels:
+  userConfirmedV1:
+    address: raad.identity.user-confirmed.v1
+    x-eventbridge:
+      source: raad.identity
+      detail-type: raad.identity.user-confirmed.v1
+      payload-location: detail
+    messages:
+      UserConfirmed:
+        $ref: '#/components/messages/UserConfirmed'
+operations:
+  sendUserConfirmed:
+    action: send
+    channel:
+      $ref: '#/channels/userConfirmedV1'
+    summary: U4 publishes after the sign-in service confirms an account.
+    messages:
+      - $ref: '#/channels/userConfirmedV1/messages/UserConfirmed'
+  receiveUserConfirmed:
+    action: receive
+    channel:
+      $ref: '#/channels/userConfirmedV1'
+    summary: U2 opens or returns the user's wallet, then registers the holder.
+    messages:
+      - $ref: '#/channels/userConfirmedV1/messages/UserConfirmed'
+components:
+  messages:
+    UserConfirmed:
+      name: UserConfirmed
+      title: A user account was confirmed in one RAAD environment.
+      correlationId:
+        location: $message.payload#/eventId
+      payload:
+        $ref: '#/components/schemas/UserConfirmedPayload'
+  schemas:
+    UserConfirmedPayload:
+      type: object
+      additionalProperties: true
+      required:
+        - specVersion
+        - eventId
+        - occurredAt
+        - environment
+        - userId
+        - email
+        - displayName
+      properties:
+        specVersion:
+          type: string
+          pattern: '^1\.[0-9]+$'
+          description: >
+            Major version 1 with any minor version. U4 emits the minor version of
+            its released contract. A consumer accepts every 1.x and ignores the
+            fields it does not know.
+        eventId:
+          type: string
+          format: uuid
+        occurredAt:
+          type: string
+          format: date-time
+          description: UTC instant with an offset.
+        environment:
+          type: string
+          enum: [dev, stg, prd]
+        userId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Opaque subject identifier from that environment's sign-in service.
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Confirmed email address; personal data, never written to logs.
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Personal data, never written to logs.

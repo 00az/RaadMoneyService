@@ -35,8 +35,8 @@ jobs:
       - run: uv run mypy src
       - run: docker compose up -d dynamodb-local
       - run: uv run pytest tests/unit tests/integration
-      - run: uv run pytest tests/unit/test_ledger_rules.py --cov-reset --cov=raad_money.ledger --cov-branch --cov-report=json:artifacts/coverage/u1-ledger.json --cov-report=term-missing
-      - run: uv run python scripts/check_ledger_coverage.py artifacts/coverage/u1-ledger.json
+      - run: uv run pytest tests/unit/test_ledger_rules.py tests/unit/test_u2_money_rules.py tests/unit/test_u2_money_core.py tests/unit/test_u2_transfer_service.py --cov-reset --cov=raad_money.ledger --cov=raad_money.transfers --cov-branch --cov-report=json:artifacts/coverage/money-core.json --cov-report=term-missing --cov-fail-under=95
+      - run: uv run python scripts/check_ledger_coverage.py artifacts/coverage/money-core.json
       - run: uv run pip-audit
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -46,6 +46,9 @@ jobs:
         run: |
           echo "RAAD_EDGE_ROLE_ARN=$(aws ssm get-parameter --name /raad/dev/platform-edge-role-arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
           echo "RAAD_CORRELATION_SECRET_ARN=$(aws ssm get-parameter --name /raad/dev/correlation-hmac/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+          # Published by the Raad platform (U4); the deploy fails closed until both exist.
+          echo "RAAD_EVENT_BUS_ARN=$(aws ssm get-parameter --name /raad/dev/event-bus/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+          echo "RAAD_ALARM_TOPIC_ARN=$(aws ssm get-parameter --name /raad/dev/alarm-topic/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
       - run: uv run cdk synth --all
       - run: uv run cdk diff --all
       - name: Expand schema with money requests disabled

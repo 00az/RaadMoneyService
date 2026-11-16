@@ -1,9 +1,8 @@
 """Real DynamoDB Local uniqueness and batch directory lookups."""
 
 import pytest
-from botocore.exceptions import ClientError
 
-from raad_money.storage import WalletDirectory
+from raad_money.storage import EmailConflict, WalletDirectory
 
 
 def test_directory_resolves_unicode_normalized_email(directory_table: str) -> None:
@@ -15,7 +14,7 @@ def test_directory_resolves_unicode_normalized_email(directory_table: str) -> No
 def test_directory_rejects_duplicate_normalized_email(directory_table: str) -> None:
     directory = WalletDirectory(directory_table)
     directory.register("holder-1", "person@example.com", "One")
-    with pytest.raises(ClientError):
+    with pytest.raises(EmailConflict):
         directory.register("holder-2", " PERSON@EXAMPLE.COM ", "Two")
 
 

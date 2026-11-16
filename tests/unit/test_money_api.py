@@ -18,6 +18,7 @@ def dependencies(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock, Mock]:
     monkeypatch.setenv(
         "CORRELATION_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:111111111111:secret:test"
     )
+    monkeypatch.setenv("ENVIRONMENT", "dev")
     monkeypatch.setattr(api, "_dependencies", lambda: (verifier, ledger, directory))
     monkeypatch.setattr(
         api,
@@ -97,21 +98,33 @@ def test_malformed_json_returns_safe_validation_error() -> None:
     assert api.handle(request, None)["statusCode"] == 400
 
 
+def history_page(rows: list[dict], next_position: object = None) -> Mock:
+    from raad_money.history import HistoryResult
+
+    reader = Mock()
+    reader.page.return_value = HistoryResult(rows, next_position)  # type: ignore[arg-type]
+    return reader
+
+
 def test_first_history_page_uses_batch_counterparty_lookup(
-    dependencies: tuple[Mock, Mock, Mock],
+    dependencies: tuple[Mock, Mock, Mock], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, ledger, directory = dependencies
     ledger.get_wallet.return_value = {"wallet_id": "w1", "balance_halalas": 5}
-    ledger.history.return_value = [
-        {
-            "transfer_id": "t1",
-            "reference": "r1",
-            "amount_halalas": 4,
-            "sender_wallet_id": "w1",
-            "recipient_wallet_id": "w2",
-            "completed_at": "2026-11-13T10:00:00Z",
-        }
-    ]
+    reader = history_page(
+        [
+            {
+                "transfer_id": "t1",
+                "reference": "r1",
+                "amount_halalas": 400,
+                "sender_wallet_id": "w1",
+                "recipient_wallet_id": "w2",
+                "completed_at": "2026-11-13T10:00:00.000Z",
+                "completed_sort_key": "2026-11-13T10:00:00.000Z#t1",
+            }
+        ]
+    )
+    monkeypatch.setattr(api, "_history_reader", lambda _ledger: reader)
     ledger.get_wallets_by_ids.return_value = {"w2": {"wallet_id": "w2", "owner_id": "holder-2"}}
     directory.get_many.return_value = {
         "holder-2": {"display_name": "B", "email_normalized": "b@example.com"}
@@ -120,18 +133,31 @@ def test_first_history_page_uses_batch_counterparty_lookup(
     payload = json.loads(result["body"])
     assert result["statusCode"] == 200
     assert payload["items"][0]["otherParty"]["displayName"] == "B"
+    assert payload["nextCursor"] is None and payload["hasMore"] is False
     directory.get_many.assert_called_once_with(["holder-2"])
 
 
-def test_first_page_rejects_cursor_until_pagination_unit(
-    dependencies: tuple[Mock, Mock, Mock],
+def test_altered_cursor_is_refused_before_reading_history(
+    dependencies: tuple[Mock, Mock, Mock], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from raad_money.cursor import CursorKeys
+
     _, ledger, _ = dependencies
     ledger.get_wallet.return_value = {"wallet_id": "w1", "balance_halalas": 5}
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    monkeypatch.setattr(
+        api,
+        "_cursor_keys",
+        lambda: CursorKeys.from_secret('{"version":"1","key":"' + "k" * 40 + '"}'),
+    )
+    reader = history_page([])
+    monkeypatch.setattr(api, "_history_reader", lambda _ledger: reader)
     request = event("GET", "/money/v1/transfers")
     request["rawQueryString"] = "cursor=opaque"
-    assert api.handle(request, None)["statusCode"] == 400
-    ledger.history.assert_not_called()
+    result = api.handle(request, None)
+    assert result["statusCode"] == 400
+    assert json.loads(result["body"])["code"] == "CURSOR_INVALID_OR_EXPIRED"
+    reader.page.assert_not_called()
 
 
 def test_dependency_failure_is_safe(
@@ -215,74 +241,90 @@ def test_transfer_validates_fields_idempotency_and_wallet(
     assert api.handle(request, None)["statusCode"] == 404
 
 
-def test_transfer_self_and_missing_recipient_wallet_are_refused(
-    dependencies: tuple[Mock, Mock, Mock],
+def keyed_transfer(amount: int = 2_500, email: str = "b@example.com") -> dict:
+    request = event("POST", "/money/v1/transfers")
+    request["headers"]["Idempotency-Key"] = "valid-idempotency-123"
+    request["body"] = json.dumps({"recipientEmail": email, "amountHalalas": amount})
+    return request
+
+
+def stub_service(monkeypatch: pytest.MonkeyPatch, **behaviour: object) -> Mock:
+    service = Mock(**behaviour)
+    monkeypatch.setattr(api, "_transfer_service", lambda _ledger, _directory: service)
+    return service
+
+
+def test_transfer_refusals_carry_first_outcome_and_replay_header(
+    dependencies: tuple[Mock, Mock, Mock], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, ledger, directory = dependencies
-    ledger.get_wallet.return_value = {"wallet_id": "w1", "balance_halalas": 100}
-    request = event("POST", "/money/v1/transfers")
-    request["headers"]["Idempotency-Key"] = "valid-idempotency-123"
-    request["body"] = json.dumps({"recipientEmail": "a@example.com", "amountHalalas": 1})
-    directory.find_by_email.return_value = {"holder_id": "sub-1"}
-    assert api.handle(request, None)["statusCode"] == 409
-    directory.find_by_email.return_value = {
-        "holder_id": "sub-2",
-        "email_normalized": "b@example.com",
-        "display_name": "B",
-    }
-    ledger.get_wallet.side_effect = [{"wallet_id": "w1", "balance_halalas": 100}, None]
-    assert api.handle(request, None)["statusCode"] == 404
+    from raad_money.ledger import TransferOutcome
+    from raad_money.transfers import TransferResponse
+
+    for code, status in (("SELF_TRANSFER", 409), ("RECIPIENT_NOT_FOUND", 404)):
+        stub_service(
+            monkeypatch,
+            **{
+                "submit.return_value": TransferResponse(
+                    TransferOutcome.refused("a" * 64, code), replayed=False
+                )
+            },
+        )
+        result = api.handle(keyed_transfer(), None)
+        assert result["statusCode"] == status
+        assert json.loads(result["body"])["code"] == code
+        assert result["headers"]["idempotency-replayed"] == "false"
 
 
-def test_transfer_success_returns_wire_shape(dependencies: tuple[Mock, Mock, Mock]) -> None:
-    _, ledger, directory = dependencies
-    ledger.get_wallet.side_effect = [
-        {"wallet_id": "w1", "balance_halalas": 100},
-        {"wallet_id": "w2", "balance_halalas": 0},
-    ]
-    directory.find_by_email.return_value = {
-        "holder_id": "sub-2",
-        "email_normalized": "b@example.com",
-        "display_name": "B",
-    }
-    ledger.transfer.return_value = {
-        "transfer_id": "t1",
-        "reference": "r1",
-        "amount_halalas": 25,
-        "sender_balance_halalas": 75,
-        "completed_at": "now",
-    }
-    request = event("POST", "/money/v1/transfers")
-    request["headers"]["Idempotency-Key"] = "valid-idempotency-123"
-    request["body"] = json.dumps({"recipientEmail": "b@example.com", "amountHalalas": 25})
-    result = api.handle(request, None)
+def test_transfer_success_returns_wire_shape(
+    dependencies: tuple[Mock, Mock, Mock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from raad_money.ledger import TransferOutcome
+    from raad_money.transfers import TransferResponse
+
+    _, _, directory = dependencies
+    outcome = TransferOutcome.completed(
+        fingerprint="a" * 64,
+        transfer_id="6f1c2c7e-6a4b-4d55-9a57-1f2d3c4b5a69",
+        reference="R-23456789ABCD",
+        amount_halalas=2_500,
+        balance_after_halalas=7_500,
+        completed_at="2026-11-16T10:00:00.000Z",
+        recipient_profile_version_id="version-b",
+    )
+    stub_service(monkeypatch, **{"submit.return_value": TransferResponse(outcome, False)})
+    directory.get_profile_version.return_value = {"email": "B@example.com", "display_name": "B"}
+    result = api.handle(keyed_transfer(), None)
     assert result["statusCode"] == 201
-    assert "idempotency-replayed" not in result["headers"]
-    assert json.loads(result["body"])["balanceAfter"]["amountHalalas"] == 75
+    assert result["headers"]["idempotency-replayed"] == "false"
+    body = json.loads(result["body"])
+    assert body["balanceAfter"]["amountHalalas"] == 7_500
+    assert body["recipient"] == {"email": "B@example.com", "displayName": "B"}
+    directory.get_profile_version.assert_called_once_with("version-b")
 
 
-def test_transfer_domain_errors_map_to_safe_responses(
-    dependencies: tuple[Mock, Mock, Mock],
+def test_transfer_low_balance_and_store_failures_map_to_safe_responses(
+    dependencies: tuple[Mock, Mock, Mock], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from raad_money.ledger import InsufficientFunds
+    from raad_money.ledger import TransferOutcome
+    from raad_money.store_errors import TransientStoreError
+    from raad_money.transfers import TransferResponse
 
-    _, ledger, directory = dependencies
-    ledger.get_wallet.side_effect = [
-        {"wallet_id": "w1", "balance_halalas": 100},
-        {"wallet_id": "w2", "balance_halalas": 0},
-    ]
-    directory.find_by_email.return_value = {"holder_id": "sub-2"}
-    ledger.transfer.side_effect = InsufficientFunds
-    request = event("POST", "/money/v1/transfers")
-    request["headers"]["Idempotency-Key"] = "valid-idempotency-123"
-    request["body"] = json.dumps({"recipientEmail": "b@example.com", "amountHalalas": 25})
-    assert api.handle(request, None)["statusCode"] == 422
-    ledger.transfer.side_effect = ValueError("invalid")
-    ledger.get_wallet.side_effect = [
-        {"wallet_id": "w1", "balance_halalas": 100},
-        {"wallet_id": "w2", "balance_halalas": 0},
-    ]
-    assert api.handle(request, None)["statusCode"] == 400
+    stub_service(
+        monkeypatch,
+        **{
+            "submit.return_value": TransferResponse(
+                TransferOutcome.refused("a" * 64, "INSUFFICIENT_FUNDS"), replayed=True
+            )
+        },
+    )
+    low = api.handle(keyed_transfer(), None)
+    assert low["statusCode"] == 422 and low["headers"]["idempotency-replayed"] == "true"
+    stub_service(monkeypatch, **{"submit.side_effect": TransientStoreError("busy")})
+    unavailable = api.handle(keyed_transfer(), None)
+    assert unavailable["statusCode"] == 503
+    assert "idempotency-replayed" not in unavailable["headers"]
+    stub_service(monkeypatch, **{"submit.side_effect": ValueError("corrupt stored outcome")})
+    assert api.handle(keyed_transfer(), None)["statusCode"] == 503
 
 
 @pytest.mark.parametrize("query", ["limit=nope", "limit=0", "limit=101"])
