@@ -1,0 +1,48 @@
+name: money-service-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  # gitleaks lists a pull request's commits to scan them.
+  pull-requests: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      RAAD_EDGE_ROLE_ARN: arn:aws:iam::111111111111:role/raad-build-edge
+      RAAD_CORRELATION_SECRET_ARN: arn:aws:secretsmanager:us-east-1:111111111111:secret:raad/dev/correlation-hmac-build
+      RAAD_EVENT_BUS_ARN: arn:aws:events:us-east-1:111111111111:event-bus/raad-dev-build
+      RAAD_ALARM_TOPIC_ARN: arn:aws:sns:us-east-1:111111111111:raad-dev-alarms-build
+      CDK_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs the pull request's commits, not only the tip.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --global aws-cdk
+      - run: uv sync --locked --all-groups
+      - run: docker compose up -d dynamodb-local
+      - run: uv run pytest tests/unit tests/integration
+      - run: uv run pytest tests/unit/test_ledger_rules.py tests/unit/test_u2_money_rules.py tests/unit/test_u2_money_core.py tests/unit/test_u2_transfer_service.py --cov-reset --cov=raad_money.ledger --cov=raad_money.transfers --cov-branch --cov-report=json:artifacts/coverage/money-core.json --cov-report=term-missing --cov-fail-under=95
+      - run: uv run python scripts/check_ledger_coverage.py artifacts/coverage/money-core.json
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run mypy src
+      - run: uv run pip-audit
+      - run: uv run cdk synth
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - if: always()
+        run: docker compose stop dynamodb-local

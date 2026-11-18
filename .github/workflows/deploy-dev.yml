@@ -1,0 +1,63 @@
+name: deploy-money-service-dev
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "openapi/**"
+      - "app.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/deploy-dev.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      RAAD_ENVIRONMENT: dev
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --global aws-cdk
+      - run: uv sync --locked --all-groups
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run mypy src
+      - run: docker compose up -d dynamodb-local
+      - run: uv run pytest tests/unit tests/integration
+      - run: uv run pytest tests/unit/test_ledger_rules.py tests/unit/test_u2_money_rules.py tests/unit/test_u2_money_core.py tests/unit/test_u2_transfer_service.py --cov-reset --cov=raad_money.ledger --cov=raad_money.transfers --cov-branch --cov-report=json:artifacts/coverage/money-core.json --cov-report=term-missing --cov-fail-under=95
+      - run: uv run python scripts/check_ledger_coverage.py artifacts/coverage/money-core.json
+      - run: uv run pip-audit
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Read platform role and secret references
+        run: |
+          echo "RAAD_EDGE_ROLE_ARN=$(aws ssm get-parameter --name /raad/dev/platform-edge-role-arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+          echo "RAAD_CORRELATION_SECRET_ARN=$(aws ssm get-parameter --name /raad/dev/correlation-hmac/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+          # Published by the Raad platform (U4); the deploy fails closed until both exist.
+          echo "RAAD_EVENT_BUS_ARN=$(aws ssm get-parameter --name /raad/dev/event-bus/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+          echo "RAAD_ALARM_TOPIC_ARN=$(aws ssm get-parameter --name /raad/dev/alarm-topic/arn --query Parameter.Value --output text)" >> "$GITHUB_ENV"
+      - run: uv run cdk synth --all
+      - run: uv run cdk diff --all
+      - name: Expand schema with money requests disabled
+        run: uv run cdk deploy --all --require-approval never --parameters RaadMoneyService-dev:ActivateCanonicalWriter=false
+      - name: Refuse activation until every history reference is canonical
+        run: uv run python scripts/migrate_transactions.py --environment dev --ledger-table raad-dev-ledger --transactions-table raad-dev-transactions --check-ready
+      # On failure requests stay disabled. Explicit engineer migration is required;
+      # never reset balances or roll back to the incompatible legacy writer.
+      - name: Activate canonical-aware writer after readiness
+        run: uv run cdk deploy --all --require-approval never --parameters RaadMoneyService-dev:ActivateCanonicalWriter=true
+      - if: always()
+        run: docker compose stop dynamodb-local

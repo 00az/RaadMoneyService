@@ -1,0 +1,524 @@
+openapi: 3.1.0
+info:
+  title: RAAD Money API
+  version: 1.0.0-u2.1
+  description: >
+    Wallet balance, recipient resolution, wallet-to-wallet transfer and transfer
+    history for the RAAD MVP. Every amount is a whole number of halalas and the
+    only currency is SAR. This U2 pre-release implements the full v1 behavior:
+    saved first outcomes replayed for a repeated Idempotency-Key, the 100 to
+    50000 halala transfer range, and stable cursor paging of transfer history.
+    It stays a pre-release until the v1.0.0 provider tests pass in CI.
+servers:
+  - url: https://{apiHost}/money/v1
+    variables:
+      apiHost:
+        default: api.dev.raad.example
+        description: Environment-specific API host supplied by C4.
+security:
+  - bearerAuth: []
+paths:
+  /wallet:
+    put:
+      operationId: ensureWallet
+      summary: Open the caller's wallet if absent, or return the existing wallet.
+      description: >
+        The safety-net path for wallet setup. Safe under retries and simultaneous
+        calls: one wallet exists per caller and the 100000-halalah opening balance
+        is credited once. The caller is taken only from the verified access token.
+      responses:
+        '200':
+          description: The existing wallet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '201':
+          description: A wallet was opened with the starting balance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '401':
+          $ref: '#/components/responses/AuthenticationRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: The user's verified email is already held by another wallet holder.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      operationId: getWallet
+      summary: Read the caller's wallet balance.
+      responses:
+        '200':
+          description: The caller's wallet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '401':
+          $ref: '#/components/responses/AuthenticationRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The caller has no wallet; the app should call PUT /wallet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /recipients/resolve:
+    post:
+      operationId: resolveRecipient
+      summary: Resolve one complete email address for the transfer review screen.
+      description: >
+        POST keeps the email address out of the URL and normal access logs. This is
+        an exact lookup only: no partial matching, list or search. It counts toward
+        the same per-user recipient-lookup limit as POST /transfers, so sending to
+        an unknown address cannot bypass the limit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveRecipientRequest'
+      responses:
+        '200':
+          description: One recipient for the review screen.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recipient'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/AuthenticationRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/RecipientNotFound'
+        '409':
+          description: The email belongs to the caller; a transfer to oneself is not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /transfers:
+    post:
+      operationId: createTransfer
+      summary: Transfer simulated SAR from the caller's wallet to another RAAD wallet.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTransferRequest'
+      responses:
+        '201':
+          description: The transfer completed. Replayed completed requests return this same body.
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/AuthenticationRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            RECIPIENT_NOT_FOUND: no recipient has the normalized email address. It
+            is a persisted first business outcome for this caller and idempotency
+            key. WALLET_NOT_FOUND: the caller has no wallet yet. Nothing is
+            persisted against the key and Idempotency-Replayed is omitted, so the
+            app calls PUT /wallet and may then send the same request with the
+            same key.
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: >
+            SELF_TRANSFER is a persisted first business outcome. IDEMPOTENCY_KEY_REUSED
+            means this caller already used the key with a different normalized recipient
+            or amount; it never replaces the first outcome.
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: >
+            A persisted first business refusal: AMOUNT_OUT_OF_RANGE or
+            INSUFFICIENT_FUNDS.
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      operationId: listTransfers
+      summary: Read one stable page of the caller's completed sent and received transfers.
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque nextCursor returned by the preceding page. The app never parses or changes it.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 2048
+        - name: limit
+          in: query
+          required: false
+          description: >
+            Page size; defaults to 20 and cannot exceed 100. A request that sends
+            a cursor must use the same page size as the request that started that
+            cursor's chain.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: A stable page, newest first with a fixed tiebreaker.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPage'
+        '400':
+          description: Invalid or expired cursor; code CURSOR_INVALID_OR_EXPIRED tells the app to reload the first page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/AuthenticationRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The caller has no wallet (WALLET_NOT_FOUND); the app should call PUT /wallet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from the environment's shared sign-in service (C3).
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >
+        Opaque key generated by MobileApp for one transfer intent. It is scoped to
+        the verified caller. Reuse with identical recipientEmail and amountHalalas
+        returns the first completed or refused outcome; reuse with different details
+        returns IDEMPOTENCY_KEY_REUSED.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._~-]+$'
+  headers:
+    IdempotencyReplayed:
+      description: >
+        Sent only on a response that reports a persisted outcome or a key
+        conflict. false on the first response for a persisted outcome and on
+        IDEMPOTENCY_KEY_REUSED; true when this response replays the persisted
+        first outcome of an earlier request with this caller and key. Omitted on
+        every response that persists nothing (400, 401, 403, WALLET_NOT_FOUND,
+        429, 500 and 503).
+      schema:
+        type: boolean
+  schemas:
+    Wallet:
+      type: object
+      additionalProperties: true
+      required: [balance]
+      properties:
+        balance:
+          $ref: '#/components/schemas/Money'
+    Money:
+      type: object
+      additionalProperties: true
+      required: [amountHalalas, currency]
+      properties:
+        amountHalalas:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Whole halalas; never a decimal or floating-point number.
+        currency:
+          type: string
+          const: SAR
+    ResolveRecipientRequest:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          type: string
+          maxLength: 512
+          description: >
+            Raw user input. MoneyApi trims surrounding Unicode whitespace,
+            normalizes to NFC, lowercases for comparison, then validates the
+            normalized complete address (maximum 254 characters).
+          x-normalization: trim-unicode-whitespace+nfc+lowercase-before-validation
+    Recipient:
+      type: object
+      additionalProperties: true
+      required: [displayName, email]
+      properties:
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 200
+        email:
+          type: string
+          format: email
+          maxLength: 254
+    CreateTransferRequest:
+      type: object
+      additionalProperties: false
+      required: [recipientEmail, amountHalalas]
+      properties:
+        recipientEmail:
+          type: string
+          maxLength: 512
+          description: >
+            Raw user input. MoneyApi trims surrounding Unicode whitespace,
+            normalizes to NFC, lowercases for lookup, self-transfer comparison
+            and the idempotency fingerprint, then validates the normalized
+            complete address (maximum 254 characters).
+          x-normalization: trim-unicode-whitespace+nfc+lowercase-before-validation
+        amountHalalas:
+          type: integer
+          format: int64
+          description: >
+            Whole halalas. Schema validation accepts any int64 so the Ledger can
+            persist AMOUNT_OUT_OF_RANGE as the first idempotent business outcome;
+            the allowed business range is 100 through 50000 inclusive.
+    TransferResult:
+      type: object
+      additionalProperties: true
+      required: [transferId, reference, recipient, amount, completedAt, balanceAfter]
+      properties:
+        transferId:
+          type: string
+          format: uuid
+        reference:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: >
+            User-facing reference, separate from transferId. Transfers completed by
+            this release use R- followed by 12 characters from
+            23456789ABCDEFGHJKMNPQRSTUVWXYZ; history may also show references issued
+            by the U1 pre-release. Clients display it and never parse it.
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+        amount:
+          $ref: '#/components/schemas/Money'
+        completedAt:
+          type: string
+          format: date-time
+          description: UTC instant with an offset.
+        balanceAfter:
+          $ref: '#/components/schemas/Money'
+    TransferListItem:
+      type: object
+      additionalProperties: true
+      required: [transferId, reference, direction, otherParty, amount, completedAt]
+      properties:
+        transferId:
+          type: string
+          format: uuid
+        reference:
+          type: string
+          minLength: 1
+          maxLength: 64
+        direction:
+          type: string
+          enum: [sent, received]
+        otherParty:
+          $ref: '#/components/schemas/Recipient'
+        amount:
+          $ref: '#/components/schemas/Money'
+        completedAt:
+          type: string
+          format: date-time
+    TransferPage:
+      type: object
+      additionalProperties: true
+      required: [items, nextCursor]
+      properties:
+        hasMore:
+          type: boolean
+          description: >
+            True exactly when nextCursor is non-null, that is when another page of
+            the same snapshot exists. Kept for clients built against the U1
+            pre-release; new clients follow nextCursor.
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/TransferListItem'
+        nextCursor:
+          type: [string, 'null']
+          maxLength: 2048
+          description: >
+            Opaque cursor for the next page. Non-null exactly when another page
+            exists and null at the end. It expires 24 hours after the first page
+            of its chain was issued.
+    FieldError:
+      type: object
+      additionalProperties: true
+      required: [field, code]
+      properties:
+        field:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+    Error:
+      type: object
+      additionalProperties: true
+      required: [code, message, correlationId]
+      properties:
+        code:
+          type: string
+          enum:
+            - VALIDATION_ERROR
+            - AUTHENTICATION_REQUIRED
+            - FORBIDDEN
+            - WALLET_NOT_FOUND
+            - RECIPIENT_NOT_FOUND
+            - SELF_TRANSFER
+            - AMOUNT_OUT_OF_RANGE
+            - INSUFFICIENT_FUNDS
+            - IDEMPOTENCY_KEY_REUSED
+            - CURSOR_INVALID_OR_EXPIRED
+            - RATE_LIMITED
+            - INTERNAL_ERROR
+            - SERVICE_UNAVAILABLE
+            - TOKEN_VERIFIER_UNAVAILABLE
+        message:
+          type: string
+          description: Safe fallback message with no personal or internal detail. The app branches on code, not this text.
+        correlationId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        fieldErrors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+  responses:
+    ValidationError:
+      description: The request shape or a field is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    AuthenticationRequired:
+      description: The token is missing, invalid or expired. The response reveals no wallet data.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: >
+        The public API edge refused the request under a firewall rule (C5), code
+        FORBIDDEN. The response reveals no wallet data and nothing about the rule.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RecipientNotFound:
+      description: No RAAD wallet holder has this complete normalized email address.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: The per-verified-user or endpoint limit was reached.
+      headers:
+        Retry-After:
+          description: Whole seconds until the client may retry.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Unexpected failure; no stack trace or internal name is returned.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: A required store or service is unavailable.
+      headers:
+        Retry-After:
+          description: Whole seconds until a read may be retried.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

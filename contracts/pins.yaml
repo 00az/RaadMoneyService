@@ -1,0 +1,12 @@
+# Contracts this repo consumes. Each entry pins one byte-for-byte copy under
+# contracts/pinned/. Tests read only those copies and fail if a copy's
+# SHA-256 differs from its entry. Change a pin only through a pull request.
+pins:
+  - contract: c2-identity-events
+    owner: 00az/Raad
+    file: contracts/c2-identity-events-v1.asyncapi.yaml
+    copy: contracts/pinned/c2-identity-events/c2-identity-events-v1.asyncapi.yaml
+    tag: null
+    commit: 36861cd7c7364aaee766fc7dc6e469d73460dc36
+    sha256: d244f8e585f907398a3d724dd4085501aee6929c9de38f39f07e8bbcb343c6b6
+    note: Development pin; no release tag exists yet. Replace it with a contract/c2-identity-events tag once U4's provider tests pass.
