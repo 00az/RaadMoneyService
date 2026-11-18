@@ -1,0 +1,16 @@
+title = "RAAD money service secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+# Commit 30b1d3b ("codeGen") committed CDK synth output by mistake; bf7b19b
+# stopped tracking it and cdk.out/ is gitignored. The 235 findings there are
+# CDK asset hashes (S3Key, objectKey) and AWS SDK example data bundled in a
+# Lambda asset, not credentials. Scanning a pull request reads every commit,
+# so this generated folder is exempted for this one rule only.
+description = "Generated CDK synth output (cdk.out/), no longer tracked"
+paths = ['''^cdk\.out/''']
