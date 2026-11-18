@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  # gitleaks lists a pull request's commits to scan them.
+  pull-requests: read
 
 jobs:
   checks:
@@ -19,6 +21,9 @@ jobs:
       CDK_DEFAULT_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          # gitleaks needs the pull request's commits, not only the tip.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -37,5 +42,7 @@ jobs:
       - run: uv run pip-audit
       - run: uv run cdk synth
       - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - if: always()
         run: docker compose stop dynamodb-local
