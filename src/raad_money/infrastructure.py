@@ -37,6 +37,26 @@ _RUNTIME_SUPPRESSION = {
 }
 
 
+RESERVED_CONCURRENCY_CONTEXT = "raad:reservedConcurrency"
+
+
+def reserved_concurrency(scope: Construct, environment: str, value: int) -> int | None:
+    """The function's reserved concurrency, unless a dev deploy turns reservations off.
+
+    A new AWS account allows 10 concurrent executions and keeps all 10 unreserved, so no
+    reservation can be made until the limit is raised. A dev deploy in such an account passes
+    `-c raad:reservedConcurrency=off`; stg and prd refuse the switch.
+    """
+    setting = scope.node.try_get_context(RESERVED_CONCURRENCY_CONTEXT)
+    if setting is None or str(setting).lower() in ("on", "true"):
+        return value
+    if str(setting).lower() not in ("off", "false"):
+        raise ValueError(f"{RESERVED_CONCURRENCY_CONTEXT} must be on or off")
+    if environment != "dev":
+        raise ValueError(f"{RESERVED_CONCURRENCY_CONTEXT}=off is allowed only in dev")
+    return None
+
+
 class MoneyServiceStack(Stack):
     """Owns MoneyApi, the C2 consumer and their three logically isolated tables."""
 
@@ -207,7 +227,7 @@ class MoneyServiceStack(Stack):
             code=self._code(),
             timeout=Duration.seconds(7),
             memory_size=128,
-            reserved_concurrent_executions=20,
+            reserved_concurrent_executions=reserved_concurrency(self, environment, 20),
             environment={
                 "LEDGER_TABLE": self.ledger_table.table_name,
                 "TRANSACTIONS_TABLE": self.transactions_table.table_name,
