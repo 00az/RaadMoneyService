@@ -348,3 +348,35 @@ def test_cdk_nag_reports_no_unsuppressed_findings(environment: str) -> None:
     annotations = Annotations.from_stack(stack(environment, nag=True))
     annotations.has_no_error("*", Match.string_like_regexp("AwsSolutions-.*"))
     annotations.has_no_warning("*", Match.string_like_regexp("AwsSolutions-.*"))
+
+
+def _with_reservation_setting(setting: str, environment: str = "dev") -> Template:
+    app = cdk.App(context={"raad:reservedConcurrency": setting})
+    built = MoneyServiceStack(
+        app,
+        "Service",
+        environment=environment,
+        verifier_parameter=f"/raad/{environment}/verifier",
+        correlation_secret_arn=f"arn:aws:secretsmanager:us-east-1:111111111111:secret:raad/{environment}/correlation-hmac-abc",
+        edge_role_arn=f"arn:aws:iam::111111111111:role/raad-{environment}-edge",
+        event_bus_arn=BUS,
+        alarm_topic_arn=TOPIC,
+    )
+    return Template.from_stack(built)
+
+
+def test_dev_can_turn_the_money_api_reservation_off_for_a_new_account() -> None:
+    functions = _with_reservation_setting("off").find_resources("AWS::Lambda::Function")
+    assert functions
+    assert all("ReservedConcurrentExecutions" not in f["Properties"] for f in functions.values())
+
+
+@pytest.mark.parametrize("environment", ["stg", "prd"])
+def test_stg_and_prd_refuse_turning_the_reservation_off(environment: str) -> None:
+    with pytest.raises(ValueError, match="only in dev"):
+        _with_reservation_setting("off", environment)
+
+
+def test_an_unknown_reservation_setting_is_refused() -> None:
+    with pytest.raises(ValueError, match="on or off"):
+        _with_reservation_setting("maybe")
